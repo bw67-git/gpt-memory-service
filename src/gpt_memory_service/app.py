@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from difflib import unified_diff
 import shutil
@@ -17,7 +18,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .version import __version__
 
@@ -121,7 +122,16 @@ class ContextFeedEntry(BaseModel):
 
     id: Optional[str] = Field(
         default=None,
-        description="Stable identifier for deduplication (meeting id, transcript hash, etc.)",
+        description=(
+            "Stable identifier for deduplication in the format "
+            "'meeting-YYYYMMDD-slug' (e.g., meeting-20241203-roadmap-review)."
+        ),
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description=(
+            "Meeting date in YYYY-MM-DD format (typically derived from the source filename)."
+        ),
     )
     title: Optional[str] = Field(default=None, description="Human-friendly meeting title")
     captured_at: Optional[str] = Field(
@@ -136,6 +146,26 @@ class ContextFeedEntry(BaseModel):
         default_factory=dict,
         description="Arbitrary machine-readable hints (e.g., participants, tags)",
     )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not re.fullmatch(r"meeting-\d{8}-[a-z0-9-]+", value):
+            raise ValueError(
+                "id must use the format meeting-YYYYMMDD-slug (lowercase letters, numbers, dashes)"
+            )
+        return value
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("date must use the format YYYY-MM-DD")
+        return value
 
 
 class MemoryCreate(BaseModel):
@@ -211,9 +241,74 @@ async def custom_openapi():
 
 # ---------- Global state ----------
 _raw_state = load_memory()
-MEMORY_STORE: Dict[str, Memory] = {uid: Memory(**data) for uid, data in _raw_state.items()}
+
+
+def _normalize_legacy_context_feed(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort normalization for legacy context feed ids/dates.
+
+    Older persisted payloads did not enforce the new ``meeting-YYYYMMDD-slug`` format
+    (or date formatting). Instead of failing startup on validation, coerce the values
+    into a valid shape while preserving the original data for traceability.
+    """
+
+    normalized = dict(entry)
+    legacy_metadata = normalized.setdefault("metadata", {})
+
+    feed_id = normalized.get("id")
+    if isinstance(feed_id, str) and not re.fullmatch(r"meeting-\d{8}-[a-z0-9-]+", feed_id):
+        # Preserve the original id for debugging/traceability
+        legacy_metadata.setdefault("legacy_id", feed_id)
+
+        # Attempt to derive a date token from the new ``date`` field when possible; otherwise
+        # fall back to a neutral placeholder that passes validation.
+        raw_date = normalized.get("date")
+        date_token = "00000000"
+        if isinstance(raw_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+            date_token = raw_date.replace("-", "")
+
+        slug = re.sub(r"[^a-z0-9]+", "-", feed_id.lower()).strip("-") or "legacy"
+        normalized["id"] = f"meeting-{date_token}-{slug}"
+
+        logging.warning(
+            "Coerced legacy context feed id '%s' to '%s' for compatibility",
+            feed_id,
+            normalized["id"],
+        )
+
+    # Normalize malformed dates so that validation succeeds while leaving a breadcrumb.
+    feed_date = normalized.get("date")
+    if isinstance(feed_date, str) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", feed_date):
+        legacy_metadata.setdefault("legacy_date", feed_date)
+        normalized["date"] = None
+        logging.warning(
+            "Cleared legacy context feed date '%s' due to invalid format (expected YYYY-MM-DD)",
+            feed_date,
+        )
+
+    return normalized
+
+
+def _upgrade_legacy_memory_state(raw_state: Dict[str, Any]) -> Dict[str, Any]:
+    upgraded: Dict[str, Any] = {}
+    for uid, data in raw_state.items():
+        upgraded_data = dict(data)
+        context_feeds = upgraded_data.get("context_feeds")
+        if isinstance(context_feeds, list):
+            upgraded_feeds = []
+            for entry in context_feeds:
+                if isinstance(entry, dict):
+                    upgraded_feeds.append(_normalize_legacy_context_feed(entry))
+                else:
+                    upgraded_feeds.append(entry)
+            upgraded_data["context_feeds"] = upgraded_feeds
+        upgraded[uid] = upgraded_data
+    return upgraded
+
+
+_normalized_state = _upgrade_legacy_memory_state(_raw_state)
+MEMORY_STORE: Dict[str, Memory] = {uid: Memory(**data) for uid, data in _normalized_state.items()}
 _state_lock = threading.Lock()
-_last_saved_state = json.dumps(_raw_state, sort_keys=True)
+_last_saved_state = json.dumps(_normalized_state, sort_keys=True)
 
 
 # ---------- Deep merge utility ----------
@@ -262,8 +357,12 @@ def normalize_context_feeds(raw_feeds: Optional[List[Any]]) -> List[Dict[str, An
 def _context_feed_key(feed: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """Create a stable deduplication key; tolerant to missing identifiers."""
 
+    feed_id = str(feed.get("id") or "")
+    if feed_id:
+        return (feed_id, "", "", "")
+
     return (
-        str(feed.get("id") or ""),
+        "",
         str(feed.get("captured_at") or ""),
         str(feed.get("title") or ""),
         str(feed.get("summary") or ""),
@@ -276,7 +375,8 @@ def merge_context_feeds(
     """
     Merge context_feeds safely:
 
-    * Default behavior (overwrite=False): append new items, keep unique by (id, captured_at, title, summary).
+    * Default behavior (overwrite=False): append new items, keeping unique by id when present, otherwise by
+      (captured_at, title, summary).
     * overwrite=True: replace the entire array explicitly (useful for cleanup/compaction).
     * Enforces MAX_CONTEXT_FEEDS to avoid unbounded growth from large transcripts.
     """
