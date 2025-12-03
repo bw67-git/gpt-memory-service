@@ -241,9 +241,74 @@ async def custom_openapi():
 
 # ---------- Global state ----------
 _raw_state = load_memory()
-MEMORY_STORE: Dict[str, Memory] = {uid: Memory(**data) for uid, data in _raw_state.items()}
+
+
+def _normalize_legacy_context_feed(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort normalization for legacy context feed ids/dates.
+
+    Older persisted payloads did not enforce the new ``meeting-YYYYMMDD-slug`` format
+    (or date formatting). Instead of failing startup on validation, coerce the values
+    into a valid shape while preserving the original data for traceability.
+    """
+
+    normalized = dict(entry)
+    legacy_metadata = normalized.setdefault("metadata", {})
+
+    feed_id = normalized.get("id")
+    if isinstance(feed_id, str) and not re.fullmatch(r"meeting-\d{8}-[a-z0-9-]+", feed_id):
+        # Preserve the original id for debugging/traceability
+        legacy_metadata.setdefault("legacy_id", feed_id)
+
+        # Attempt to derive a date token from the new ``date`` field when possible; otherwise
+        # fall back to a neutral placeholder that passes validation.
+        raw_date = normalized.get("date")
+        date_token = "00000000"
+        if isinstance(raw_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+            date_token = raw_date.replace("-", "")
+
+        slug = re.sub(r"[^a-z0-9]+", "-", feed_id.lower()).strip("-") or "legacy"
+        normalized["id"] = f"meeting-{date_token}-{slug}"
+
+        logging.warning(
+            "Coerced legacy context feed id '%s' to '%s' for compatibility",
+            feed_id,
+            normalized["id"],
+        )
+
+    # Normalize malformed dates so that validation succeeds while leaving a breadcrumb.
+    feed_date = normalized.get("date")
+    if isinstance(feed_date, str) and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", feed_date):
+        legacy_metadata.setdefault("legacy_date", feed_date)
+        normalized["date"] = None
+        logging.warning(
+            "Cleared legacy context feed date '%s' due to invalid format (expected YYYY-MM-DD)",
+            feed_date,
+        )
+
+    return normalized
+
+
+def _upgrade_legacy_memory_state(raw_state: Dict[str, Any]) -> Dict[str, Any]:
+    upgraded: Dict[str, Any] = {}
+    for uid, data in raw_state.items():
+        upgraded_data = dict(data)
+        context_feeds = upgraded_data.get("context_feeds")
+        if isinstance(context_feeds, list):
+            upgraded_feeds = []
+            for entry in context_feeds:
+                if isinstance(entry, dict):
+                    upgraded_feeds.append(_normalize_legacy_context_feed(entry))
+                else:
+                    upgraded_feeds.append(entry)
+            upgraded_data["context_feeds"] = upgraded_feeds
+        upgraded[uid] = upgraded_data
+    return upgraded
+
+
+_normalized_state = _upgrade_legacy_memory_state(_raw_state)
+MEMORY_STORE: Dict[str, Memory] = {uid: Memory(**data) for uid, data in _normalized_state.items()}
 _state_lock = threading.Lock()
-_last_saved_state = json.dumps(_raw_state, sort_keys=True)
+_last_saved_state = json.dumps(_normalized_state, sort_keys=True)
 
 
 # ---------- Deep merge utility ----------
