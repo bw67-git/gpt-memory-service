@@ -1,0 +1,20 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Local environment files
+.env
+
+# Runtime data (memory + backups + logs)
+memory.json
+memory_backup*.json
+memory_audit.log
+backups/
+data/
+logs/
