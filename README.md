@@ -1,6 +1,6 @@
 # gpt-memory-service
 
-A backend service that provides persistent memory storage for the **APM Focus Co-Pilot** (CustomGPT). The service exposes a simple FastAPI-based REST API that supports reading, writing, and updating structured memory objects.
+A backend service that provides persistent memory storage for the **APM Focus Co-Pilot** (CustomGPT). The service exposes a FastAPI-based REST API that supports reading, writing, and updating structured memory objects.
 
 This repository contains the **application code only**. All runtime memory data remains local and is excluded from version control.
 
@@ -29,7 +29,7 @@ This project uses the classic **three‑tier architecture**:
 * Sends API requests to this backend
 * Loads memory at session start and updates it throughout usage
 
-### **2. Application Layer — FastAPI (`main.py`)**
+### **2. Application Layer — FastAPI (`src/gpt_memory_service/app.py`)**
 
 Handles all logic:
 
@@ -54,21 +54,29 @@ Not committed to GitHub:
 
 ```
 gpt-memory-service/
-│
-├── main.py                 # FastAPI backend
-├── requirements.txt        # Python dependencies
-├── .gitignore              # Ensures runtime data is excluded
-│
-├── memory.json             # (ignored) application memory
-├── memory_backup*.json     # (ignored) backups
-├── memory_audit.log        # (ignored) audit log
-├── venv/                   # (ignored) virtual environment
-└── __pycache__/            # (ignored) Python bytecode
+├── main.py                  # Production entrypoint (uvicorn without reload)
+├── src/
+│   └── gpt_memory_service/
+│       ├── __init__.py      # Exports __version__
+│       ├── app.py           # FastAPI app definition and routes
+│       └── version.py       # Single source of truth for the service version
+├── requirements.txt         # Python dependencies
+├── CHANGELOG.md             # Release history and version bump guidance
+└── .gitignore               # Ensures runtime data is excluded
 ```
+
+Runtime artifacts remain ignored:
+
+* `memory.json`
+* `memory_backup*.json`
+* `memory_audit.log`
+* `venv/`, `.venv/`, `__pycache__/`
 
 ---
 
 ## Running the Service Locally
+
+> The project follows a ``src`` layout. If you are not installing the package, set ``PYTHONPATH=src`` when running commands from the repository root.
 
 ### 1. Create a virtual environment
 
@@ -83,23 +91,37 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Start the server
+### 3a. Development server (auto-reload)
 
 ```
-uvicorn main:app --host 0.0.0.0 --port 80
+PYTHONPATH=src uvicorn gpt_memory_service.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 3b. Production-style entrypoint (no reload)
+
+```
+python main.py
 ```
 
 Local API:
 
 ```
-http://localhost:80
+http://localhost:8000
 ```
 
 Interactive docs:
 
 ```
-http://localhost:80/docs
+http://localhost:8000/docs
 ```
+
+---
+
+## Versioning
+
+* The service uses semantic versioning. The version string lives in `src/gpt_memory_service/version.py` and is re-exported via the package `__init__`.
+* The FastAPI application exposes `/version`, and the root entrypoint prints the version on startup.
+* Bump versions using `MAJOR.MINOR.PATCH` only in `version.py`, and record changes in `CHANGELOG.md`.
 
 ---
 
@@ -119,11 +141,7 @@ The CustomGPT Action must point to a **publicly accessible URL** for this servic
 
 ## External Access
 
-To make this service reachable from the OpenAI platform, expose it using any tunneling solution you prefer.
-
-A common option is using a reverse tunnel such as ngrok. Any tooling choice is valid as long as it provides a stable HTTPS URL.
-
-> Installation steps and tunnel configuration are intentionally **not** included in this README, as they depend on personal tooling preferences and are not part of the core application.
+To make this service reachable from the OpenAI platform, expose it using any tunneling solution you prefer (e.g., ngrok). Any tooling choice is valid as long as it provides a stable HTTPS URL.
 
 ---
 
@@ -142,7 +160,7 @@ This backend ensures:
 ## Health Check
 
 ```
-curl http://localhost:80/
+curl http://localhost:8000/health
 ```
 
 Expected:
@@ -150,17 +168,6 @@ Expected:
 ```
 {"status": "ok"}
 ```
-
----
-
-## Extensions
-
-For deeper documentation, you may add a `/docs` directory containing:
-
-* CustomGPT instructions
-* Memory protocol specifications
-* Architecture deep‑dives
-* Exported OpenAPI schema
 
 ---
 
