@@ -135,7 +135,7 @@ The Co-Pilot uses this backend to:
 * Save session snapshots
 * Maintain user profile state
 
-The CustomGPT Action must point to a **publicly accessible URL** for this service.
+The CustomGPT Action must point to a **stable HTTPS URL** for this service.
 
 ---
 
