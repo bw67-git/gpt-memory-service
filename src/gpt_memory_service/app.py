@@ -260,18 +260,32 @@ def safe_save_memory(action: str = "unspecified", user_id: str = "unknown"):
 
 
 # ---------- Continuous auto-save ----------
+def _autosave_if_dirty() -> bool:
+    """Persist memory to disk if the in-memory state differs from last save.
+
+    Runs synchronously and is intended to be executed in a background thread to
+    avoid blocking the main event loop with file I/O and serialization.
+    """
+    global _last_saved_state
+    with _state_lock:
+        current_state = json.dumps({uid: m.model_dump() for uid, m in MEMORY_STORE.items()}, sort_keys=True)
+        if current_state == _last_saved_state:
+            return False
+
+        save_memory(json.loads(current_state))
+        _last_saved_state = current_state
+        return True
+
+
 async def autosave_loop(app: FastAPI, interval_sec: int = 300):
     global _last_saved_state
     logging.info("Starting autosave task (%ss interval)", interval_sec)
     try:
         while not app.state.autosave_stop_event.is_set():
             await asyncio.sleep(interval_sec)
-            with _state_lock:
-                current_state = json.dumps({uid: m.model_dump() for uid, m in MEMORY_STORE.items()}, sort_keys=True)
-                if current_state != _last_saved_state:
-                    save_memory(json.loads(current_state))
-                    _last_saved_state = current_state
-                    logging.info("Autosave triggered (state changed).")
+            autosaved = await asyncio.to_thread(_autosave_if_dirty)
+            if autosaved:
+                logging.info("Autosave triggered (state changed).")
     except asyncio.CancelledError:
         logging.info("Autosave task cancelled.")
         raise
