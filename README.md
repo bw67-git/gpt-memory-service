@@ -141,6 +141,28 @@ The CustomGPT Action must point to a **stable HTTPS URL** for this service.
 
 ---
 
+## Context Feed Payload Contract
+
+Meeting summaries are ingested via the `context_feeds` array on create/patch requests. Each entry should be a JSON object with
+the following optional fields:
+
+* `id`: Stable identifier for deduplication using the format `meeting-YYYYMMDD-slug` (e.g., `meeting-20241203-roadmap-review`).
+  The date comes from the source filename, and the slug is a short topic descriptor.
+* `title`: Short title for the meeting.
+* `date`: Meeting date in `YYYY-MM-DD` format (typically parsed from the filename).
+* `captured_at`: ISO 8601 timestamp (UTC) for when the summary was produced. If omitted, the server auto-populates it.
+* `summary`: Summary text of the meeting or context.
+* `decisions`: List of decisions made (strings).
+* `follow_ups`: List of follow-up actions or tasks (strings).
+* `open_loops`: List of open questions or unresolved issues (strings).
+* `metadata`: Arbitrary object for additional data (participants, tags, etc.).
+
+Omit null or empty fields—the server normalizes entries by dropping `None` values and auto-filling `captured_at` when missing.
+Entries with the same `id` are treated as duplicates during merges; if no `id` is provided, deduplication falls back to
+`captured_at`, `title`, and `summary`.
+
+---
+
 ## External Access
 
 To make this service reachable from the OpenAI platform, expose it using any tunneling solution you prefer (e.g., ngrok). Any tooling choice is valid as long as it provides a stable HTTPS URL.

@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from difflib import unified_diff
 import shutil
@@ -17,7 +18,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .version import __version__
 
@@ -121,7 +122,16 @@ class ContextFeedEntry(BaseModel):
 
     id: Optional[str] = Field(
         default=None,
-        description="Stable identifier for deduplication (meeting id, transcript hash, etc.)",
+        description=(
+            "Stable identifier for deduplication in the format "
+            "'meeting-YYYYMMDD-slug' (e.g., meeting-20241203-roadmap-review)."
+        ),
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description=(
+            "Meeting date in YYYY-MM-DD format (typically derived from the source filename)."
+        ),
     )
     title: Optional[str] = Field(default=None, description="Human-friendly meeting title")
     captured_at: Optional[str] = Field(
@@ -136,6 +146,26 @@ class ContextFeedEntry(BaseModel):
         default_factory=dict,
         description="Arbitrary machine-readable hints (e.g., participants, tags)",
     )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not re.fullmatch(r"meeting-\d{8}-[a-z0-9-]+", value):
+            raise ValueError(
+                "id must use the format meeting-YYYYMMDD-slug (lowercase letters, numbers, dashes)"
+            )
+        return value
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("date must use the format YYYY-MM-DD")
+        return value
 
 
 class MemoryCreate(BaseModel):
@@ -262,8 +292,12 @@ def normalize_context_feeds(raw_feeds: Optional[List[Any]]) -> List[Dict[str, An
 def _context_feed_key(feed: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """Create a stable deduplication key; tolerant to missing identifiers."""
 
+    feed_id = str(feed.get("id") or "")
+    if feed_id:
+        return (feed_id, "", "", "")
+
     return (
-        str(feed.get("id") or ""),
+        "",
         str(feed.get("captured_at") or ""),
         str(feed.get("title") or ""),
         str(feed.get("summary") or ""),
@@ -276,7 +310,8 @@ def merge_context_feeds(
     """
     Merge context_feeds safely:
 
-    * Default behavior (overwrite=False): append new items, keep unique by (id, captured_at, title, summary).
+    * Default behavior (overwrite=False): append new items, keeping unique by id when present, otherwise by
+      (captured_at, title, summary).
     * overwrite=True: replace the entire array explicitly (useful for cleanup/compaction).
     * Enforces MAX_CONTEXT_FEEDS to avoid unbounded growth from large transcripts.
     """
