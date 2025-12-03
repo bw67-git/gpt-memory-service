@@ -4,6 +4,7 @@ The FastAPI instance is exported as ``app`` and configured to expose
 health/version routes in addition to the memory management endpoints.
 """
 
+import copy
 import json
 import logging
 import os
@@ -15,7 +16,6 @@ import threading
 from typing import Any, Dict, List, Optional
 import time
 
-import pytz
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -37,6 +37,7 @@ AUDIT_LOG_FILE = "memory_audit.log"
 # ---------- Helpers: save / load with backup + restore ----------
 def save_memory(data: Dict[str, Any]):
     """Atomic write with automatic backup rotation."""
+    tmp: Optional[NamedTemporaryFile] = None
     try:
         if os.path.exists(MEMORY_FILE):
             shutil.copy2(MEMORY_FILE, BACKUP_FILE)
@@ -51,7 +52,7 @@ def save_memory(data: Dict[str, Any]):
         logging.info("Memory saved successfully to %s", MEMORY_FILE)
     except Exception as e:
         logging.error("Failed to save memory: %s", e)
-        if os.path.exists(tmp.name):
+        if tmp and os.path.exists(tmp.name):
             os.remove(tmp.name)
         raise
 
@@ -171,20 +172,21 @@ _last_saved_state = json.dumps(_raw_state, sort_keys=True)
 
 # ---------- Deep merge utility ----------
 def deep_merge(existing: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(existing)
     for key, value in updates.items():
         if value is None:
             continue
-        if isinstance(value, dict) and isinstance(existing.get(key), dict):
-            existing[key] = deep_merge(existing[key], value)
-        elif isinstance(value, list) and isinstance(existing.get(key), list):
-            existing_list = existing.get(key, [])
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        elif isinstance(value, list) and isinstance(merged.get(key), list):
+            existing_list = list(merged.get(key, []))
             for item in value:
                 if item not in existing_list:
                     existing_list.append(item)
-            existing[key] = existing_list
+            merged[key] = existing_list
         else:
-            existing[key] = value
-    return existing
+            merged[key] = value
+    return merged
 
 
 # ---------- Validation + Safe Save ----------
@@ -243,30 +245,39 @@ def safe_save_memory(action: str = "unspecified", user_id: str = "unknown"):
     return True
 
 
-# ---------- Work-hour auto-save ----------
-def is_work_hours_cst() -> bool:
-    tz = pytz.timezone("America/Chicago")
-    now = datetime.now(tz)
-    return now.weekday() < 5 and 8 <= now.hour < 17
-
-
+# ---------- Autosave ----------
 def autosave_loop(interval_sec: int = 300):
     global _last_saved_state
     logging.info("Starting autosave thread (%ss interval)", interval_sec)
-    while True:
-        time.sleep(interval_sec)
-        if not is_work_hours_cst():
-            continue
+    while not _autosave_stop_event.wait(interval_sec):
         with _state_lock:
             current_state = json.dumps({uid: m.model_dump() for uid, m in MEMORY_STORE.items()}, sort_keys=True)
             if current_state != _last_saved_state:
                 save_memory(json.loads(current_state))
                 _last_saved_state = current_state
                 logging.info("Autosave triggered (state changed).")
+    logging.info("Autosave thread stopping.")
 
 
-autosave_thread = threading.Thread(target=autosave_loop, daemon=True)
-autosave_thread.start()
+_autosave_stop_event = threading.Event()
+_autosave_thread: Optional[threading.Thread] = None
+
+
+@app.on_event("startup")
+def start_autosave():
+    global _autosave_thread
+    if _autosave_thread and _autosave_thread.is_alive():
+        return
+    _autosave_stop_event.clear()
+    _autosave_thread = threading.Thread(target=autosave_loop, daemon=True)
+    _autosave_thread.start()
+
+
+@app.on_event("shutdown")
+def stop_autosave():
+    _autosave_stop_event.set()
+    if _autosave_thread:
+        _autosave_thread.join(timeout=5)
 
 
 # ---------- Routes ----------
