@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import json, os, shutil, threading, time, logging
 from tempfile import NamedTemporaryFile
 from datetime import datetime
@@ -73,23 +73,23 @@ class Profile(BaseModel):
 
 class WorkingMemory(BaseModel):
     current_focus_thread: Optional[str] = ""
-    active_priorities: Optional[List[str]] = []
-    open_loops: Optional[List[str]] = []
-    decisions_made: Optional[List[Dict[str, Any]]] = []
-    pending_follow_ups: Optional[List[Dict[str, Any]]] = []
+    active_priorities: Optional[List[str]] = Field(default_factory=list)
+    open_loops: Optional[List[str]] = Field(default_factory=list)
+    decisions_made: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    pending_follow_ups: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
 
 
 class LongTermKnowledge(BaseModel):
-    projects: Optional[List[Any]] = []
-    stakeholders: Optional[List[Any]] = []
-    systems: Optional[List[Any]] = []
+    projects: Optional[List[Any]] = Field(default_factory=list)
+    stakeholders: Optional[List[Any]] = Field(default_factory=list)
+    systems: Optional[List[Any]] = Field(default_factory=list)
 
 
 class MemoryCreate(BaseModel):
     profile: Optional[Profile] = None
     working_memory: Optional[WorkingMemory] = None
     long_term_knowledge: Optional[LongTermKnowledge] = None
-    session_snapshots: Optional[List[Any]] = []
+    session_snapshots: Optional[List[Any]] = Field(default_factory=list)
 
 
 class MemoryPatch(BaseModel):
@@ -104,7 +104,7 @@ class Memory(BaseModel):
     profile: Optional[Profile] = None
     working_memory: Optional[WorkingMemory] = None
     long_term_knowledge: Optional[LongTermKnowledge] = None
-    session_snapshots: Optional[List[Any]] = []
+    session_snapshots: Optional[List[Any]] = Field(default_factory=list)
 
 # ---------- FastAPI setup ----------
 app = FastAPI(
@@ -178,6 +178,7 @@ def audit_log(action: str, user_id: str, before: Dict[str, Any], after: Dict[str
 
 # ---------- Safe save wrapper ----------
 def safe_save_memory(action: str = "unspecified", user_id: str = "unknown"):
+    global _last_saved_state
     snapshot_before = json.loads(_last_saved_state)
     snapshot_after = {uid: m.model_dump() for uid, m in MEMORY_STORE.items()}
 
@@ -194,6 +195,7 @@ def safe_save_memory(action: str = "unspecified", user_id: str = "unknown"):
         pass
 
     save_memory(snapshot_after)
+    _last_saved_state = json.dumps(snapshot_after, sort_keys=True)
     audit_log(action, user_id, snapshot_before.get(user_id, {}), snapshot_after.get(user_id, {}))
     return True
 
