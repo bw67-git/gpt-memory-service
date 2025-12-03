@@ -256,7 +256,8 @@ def normalize_context_feeds(raw_feeds: Optional[List[Any]]) -> List[Dict[str, An
 
         normalized.append(feed_dict)
 
-    return normalized[:MAX_CONTEXT_FEEDS]
+    # Keep the most recent entries when trimming so new context feeds are not dropped
+    return normalized[-MAX_CONTEXT_FEEDS:]
 
 
 def _context_feed_key(feed: Dict[str, Any]) -> Tuple[str, str, str, str]:
