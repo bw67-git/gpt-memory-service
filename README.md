@@ -48,6 +48,8 @@ Not committed to GitHub:
 * `memory_backup_<timestamp>.json` — rolling backups
 * `memory_audit.log` — append‑only diff log
 
+> The service will create `memory.json` automatically on first write if it doesn't already exist, alongside its backup and audit companions.
+
 ---
 
 ## Repository Structure
