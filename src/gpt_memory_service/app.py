@@ -14,7 +14,7 @@ from difflib import unified_diff
 import shutil
 from tempfile import NamedTemporaryFile
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -31,6 +31,7 @@ logging.basicConfig(
 MEMORY_FILE = "memory.json"
 BACKUP_FILE = "memory_backup.json"
 AUDIT_LOG_FILE = "memory_audit.log"
+MAX_CONTEXT_FEEDS = 500  # guardrail to prevent unbounded growth from transcript ingestion
 
 
 # ---------- Helpers: save / load with backup + restore ----------
@@ -115,11 +116,34 @@ class LongTermKnowledge(BaseModel):
     systems: Optional[List[Any]] = Field(default_factory=list)
 
 
+class ContextFeedEntry(BaseModel):
+    """Structured snapshot from the Meeting Synth Co-Pilot."""
+
+    id: Optional[str] = Field(
+        default=None,
+        description="Stable identifier for deduplication (meeting id, transcript hash, etc.)",
+    )
+    title: Optional[str] = Field(default=None, description="Human-friendly meeting title")
+    captured_at: Optional[str] = Field(
+        default=None,
+        description="ISO8601 timestamp when this summary was produced",
+    )
+    summary: Optional[str] = None
+    decisions: Optional[List[str]] = Field(default_factory=list)
+    follow_ups: Optional[List[str]] = Field(default_factory=list)
+    open_loops: Optional[List[str]] = Field(default_factory=list)
+    metadata: Optional[Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Arbitrary machine-readable hints (e.g., participants, tags)",
+    )
+
+
 class MemoryCreate(BaseModel):
     profile: Optional[Profile] = None
     working_memory: Optional[WorkingMemory] = None
     long_term_knowledge: Optional[LongTermKnowledge] = None
     session_snapshots: Optional[List[Any]] = Field(default_factory=list)
+    context_feeds: Optional[List[ContextFeedEntry]] = Field(default_factory=list)
 
 
 class MemoryPatch(BaseModel):
@@ -127,6 +151,14 @@ class MemoryPatch(BaseModel):
     working_memory: Optional[Dict[str, Any]] = None
     long_term_knowledge: Optional[Dict[str, Any]] = None
     session_snapshots: Optional[Any] = None
+    context_feeds: Optional[List[ContextFeedEntry]] = None
+    context_feeds_overwrite: Optional[bool] = Field(
+        default=False,
+        description=(
+            "When true, replaces the entire context_feeds array instead of appending. "
+            "Default False for backward-safe merging."
+        ),
+    )
 
 
 class Memory(BaseModel):
@@ -135,6 +167,7 @@ class Memory(BaseModel):
     working_memory: Optional[WorkingMemory] = None
     long_term_knowledge: Optional[LongTermKnowledge] = None
     session_snapshots: Optional[List[Any]] = Field(default_factory=list)
+    context_feeds: Optional[List[ContextFeedEntry]] = Field(default_factory=list)
 
 
 # ---------- FastAPI setup ----------
@@ -200,6 +233,72 @@ def deep_merge(existing: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, A
             merged[key] = existing_list
         else:
             merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def normalize_context_feeds(raw_feeds: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    """Ensure context_feeds entries are dicts with timestamps and without ``None`` values."""
+
+    normalized: List[Dict[str, Any]] = []
+    now_iso = datetime.utcnow().isoformat()
+
+    for feed in raw_feeds or []:
+        if isinstance(feed, ContextFeedEntry):
+            feed_dict = feed.model_dump(exclude_none=True)
+        elif isinstance(feed, dict):
+            feed_dict = {k: v for k, v in feed.items() if v is not None}
+        else:
+            raise HTTPException(status_code=400, detail="context_feeds entries must be objects")
+
+        # auto-fill timestamp to preserve ordering and auditability
+        if not feed_dict.get("captured_at"):
+            feed_dict["captured_at"] = now_iso
+
+        normalized.append(feed_dict)
+
+    return normalized[:MAX_CONTEXT_FEEDS]
+
+
+def _context_feed_key(feed: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Create a stable deduplication key; tolerant to missing identifiers."""
+
+    return (
+        str(feed.get("id") or ""),
+        str(feed.get("captured_at") or ""),
+        str(feed.get("title") or ""),
+        str(feed.get("summary") or ""),
+    )
+
+
+def merge_context_feeds(
+    existing: Optional[List[Any]], updates: Optional[List[Any]], overwrite: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Merge context_feeds safely:
+
+    * Default behavior (overwrite=False): append new items, keep unique by (id, captured_at, title, summary).
+    * overwrite=True: replace the entire array explicitly (useful for cleanup/compaction).
+    * Enforces MAX_CONTEXT_FEEDS to avoid unbounded growth from large transcripts.
+    """
+
+    existing_normalized = normalize_context_feeds(existing)
+    updates_normalized = normalize_context_feeds(updates)
+
+    if overwrite:
+        merged = updates_normalized
+    else:
+        seen = {_context_feed_key(feed) for feed in existing_normalized}
+        merged = list(existing_normalized)
+        for feed in updates_normalized:
+            key = _context_feed_key(feed)
+            if key not in seen:
+                merged.append(feed)
+                seen.add(key)
+
+    # keep newest entries last and trimmed
+    if len(merged) > MAX_CONTEXT_FEEDS:
+        merged = merged[-MAX_CONTEXT_FEEDS:]
+
     return merged
 
 
@@ -317,7 +416,12 @@ def create_memory(user_id: str, payload: MemoryCreate, overwrite: bool = False) 
             status_code=409,
             detail=f"Memory for '{user_id}' already exists. Use PATCH or set ?overwrite=true."
         )
-    mem = Memory(user_id=user_id, **payload.model_dump())
+    payload_data = payload.model_dump()
+    payload_context = payload_data.pop("context_feeds", None)
+    if payload_context is not None:
+        payload_data["context_feeds"] = merge_context_feeds([], payload_context, overwrite=True)
+
+    mem = Memory(user_id=user_id, **payload_data)
     with _state_lock:
         MEMORY_STORE[user_id] = mem
         safe_save_memory(action="create", user_id=user_id)
@@ -329,7 +433,17 @@ def patch_memory(user_id: str, payload: MemoryPatch) -> Memory:
     existing = MEMORY_STORE.get(user_id)
     base_data: Dict[str, Any] = existing.model_dump() if existing else {}
     updates = payload.model_dump(exclude_unset=True)
+    context_feeds_updates = updates.pop("context_feeds", None)
+    context_feeds_overwrite = updates.pop("context_feeds_overwrite", False)
+
     merged = deep_merge(base_data, updates)
+    existing_feeds = base_data.get("context_feeds") or []
+    if context_feeds_updates is not None or existing_feeds:
+        merged["context_feeds"] = merge_context_feeds(
+            existing_feeds,
+            context_feeds_updates or [],
+            overwrite=context_feeds_overwrite if context_feeds_updates is not None else False,
+        )
     merged.pop("user_id", None)
     mem = Memory(user_id=user_id, **merged)
     with _state_lock:
