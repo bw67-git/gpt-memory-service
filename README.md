@@ -1,4 +1,4 @@
-# gpt-memory-service
+# gpt-memory-service 1.0
 
 A backend service that provides persistent memory storage for the **APM Focus Co-Pilot** (CustomGPT). The service exposes a FastAPI-based REST API that supports reading, writing, and updating structured memory objects.
 
