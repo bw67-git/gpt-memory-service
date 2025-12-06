@@ -348,7 +348,7 @@ def create_memory(user_id: str, payload: MemoryCreate, overwrite: bool = False) 
             status_code=409,
             detail=f"Memory for '{user_id}' already exists. Use PATCH or set ?overwrite=true."
         )
-    payload_data = payload.model_dump()
+    payload_data = payload.model_dump(exclude_none=True)
     payload_events = payload_data.pop("events", [])
     events = merge_events([], payload_events, overwrite=True)
     payload_data["events"] = events
