@@ -17,7 +17,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.append(str(SRC_DIR))
 
 from gpt_memory_service.app import app  # noqa: E402
+from gpt_memory_service.version import __version__  # noqa: E402
 
 if __name__ == "__main__":
-    print(f"Starting GPT Memory Service v2.0.0")
+     print(f"Starting GPT Memory Service v{__version__}")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
